@@ -157,7 +157,7 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
 # power sampling with autoregressive mcmc
-def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16):
+def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16, stop_controller=None):
     c = len(context)
     print(f'alpha: {1/temp}')
     gen = []
@@ -203,15 +203,19 @@ def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_ne
                 del log_prob_prop
                 del target_log_prob_cur
 
+        if stop_controller is not None and stop_controller(log_probs_norm):
+            acceptance_ratio = acceptances/attempts if attempts else 0.0
+            return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
+
         if p.tokenizer.eos_token_id in gen:
             eos_idx = gen.index(p.tokenizer.eos_token_id)
             gen = gen[:eos_idx + 1]
             log_probs_norm = log_probs_norm[:eos_idx + 1]
             log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
-            acceptance_ratio = acceptances/attempts
+            acceptance_ratio = acceptances/attempts if attempts else 0.0
             return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
-    acceptance_ratio = acceptances/attempts
+    acceptance_ratio = acceptances/attempts if attempts else 0.0
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=psamp_math
+#SBATCH --job-name=cloudspace_math
 #SBATCH -t 0-23:59                 # Runtime in D-HH:MM
 #SBATCH --mem=200000               # Memory pool for all cores (MB)
 #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3:1
@@ -22,7 +22,7 @@ export TRANSFORMERS_CACHE="$HF_HOME/models"
 export PYTHONPATH="$PYTHONPATH:{/path/to/reasoning-with-sampling/llm_experiments}"
 export HF_TOKEN={HF_TOKEN}
 
-source activate psamp
+source activate cloudspace
 cd /path/to/reasoning-with-sampling/llm_experiments
 
 echo "Running shard BATCH_IDX=${BATCH_IDX} with SEED=${SEED} (task ${SLURM_ARRAY_TASK_ID})"

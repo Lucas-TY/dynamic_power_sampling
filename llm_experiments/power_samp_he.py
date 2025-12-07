@@ -27,6 +27,12 @@ import transformers
 from grader_utils.parse_utils import parse_answer
 from constants import *
 from power_samp_utils import *
+from metrics.generation_metrics import compute_generation_metrics, compute_metrics_from_log_probs
+from metrics.dynamic_controller import DynamicStopController
+
+
+def _blank_metrics():
+    return {"entropy": float("nan"), "perplexity": float("nan"), "self_confidence": float("nan")}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -40,6 +46,12 @@ if __name__ == "__main__":
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
+    parser.add_argument("--dynamic_metric", action="store", type=str, default="none",
+                        choices=["none", "entropy", "perplexity", "self_confidence"])
+    parser.add_argument("--entropy_threshold", type=float, default=1.0)
+    parser.add_argument("--perplexity_threshold", type=float, default=3.0)
+    parser.add_argument("--self_conf_threshold", type=float, default=0.8)
+    parser.add_argument("--dynamic_min_tokens", type=int, default=64)
     args = parser.parse_args()
 
     random.seed(0)
@@ -139,7 +151,23 @@ if __name__ == "__main__":
         print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("std done")
 
-        mcmc_temp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
+        stop_controller = None
+        if args.dynamic_metric != "none":
+            stop_controller = DynamicStopController(
+                metric=args.dynamic_metric,
+                entropy_threshold=args.entropy_threshold,
+                perplexity_threshold=args.perplexity_threshold,
+                self_conf_threshold=args.self_conf_threshold,
+                min_tokens=args.dynamic_min_tokens,
+            )
+        mcmc_temp_output, log_probs_norm, _, acceptance_ratio = mcmc_power_samp(
+            autoreg_sampler,
+            prefx,
+            temp,
+            mcmc_steps,
+            max_new_tokens=3072,
+            stop_controller=stop_controller,
+        )
 
         print(len(std_output))
         print(len(naive_temp_output))
@@ -159,6 +187,14 @@ if __name__ == "__main__":
         std_answer = parse_answer(std_completion)
         mcmc_answer = parse_answer(mcmc_completion)
         
+        if args.dynamic_metric != "none":
+            naive_metrics = compute_generation_metrics(naive_temp_output.scores, naive_generated_ids)
+            std_metrics = compute_generation_metrics(std_output.scores, std_generated_ids)
+            mcmc_metrics = compute_metrics_from_log_probs(log_probs_norm)
+        else:
+            naive_metrics = _blank_metrics()
+            std_metrics = _blank_metrics()
+            mcmc_metrics = _blank_metrics()
         print(f'Acceptance: {acceptance_ratio}')
 
 
@@ -168,6 +204,18 @@ if __name__ == "__main__":
             "naive_completion": naive_completion,
             "std_completion": std_completion,
             "mcmc_completion": mcmc_completion,
+            "naive_entropy": naive_metrics["entropy"],
+            "naive_perplexity": naive_metrics["perplexity"],
+            "naive_self_confidence": naive_metrics["self_confidence"],
+            "std_entropy": std_metrics["entropy"],
+            "std_perplexity": std_metrics["perplexity"],
+            "std_self_confidence": std_metrics["self_confidence"],
+            "mcmc_entropy": mcmc_metrics["entropy"],
+            "mcmc_perplexity": mcmc_metrics["perplexity"],
+            "mcmc_self_confidence": mcmc_metrics["self_confidence"],
+            "acceptance_ratio": acceptance_ratio,
+            "dynamic_metric": args.dynamic_metric,
+            "dynamic_stop_triggered": stop_controller.triggered if stop_controller else False,
         })
 
     
@@ -187,15 +235,6 @@ if __name__ == "__main__":
 
 
         
-
-
-
-
-
-
-
-
-
 
 
 

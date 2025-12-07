@@ -21,7 +21,8 @@ Run the following script to setup environment.
 git clone https://github.com/aakaran/reasoning-with-sampling.git
 cd reasoning-with-sampling
 conda env create -f environment.yml
-conda activate psamp
+conda activate cloudspace
+python llm_experiments/scripts/download_eval_data.py  # fetch HumanEval/GPQA/AlpacaEval data
 ```
 
 
@@ -33,6 +34,34 @@ To run power sampling on MATH500 with 8 seeds and the eval set split across 5 sh
 sbatch llm_experiments/scripts/power_samp_math.sh
 ```
 The output is several .csv files (based on the shard and seed number) that store the response outputs, correct answers, original prompts, etc. 
+
+### Dynamic Sampling (optional)
+To experiment with adaptive sampling during generation, set the following environment variables before running any `power_samp_*_local.sh`:
+
+```bash
+export DYNAMIC_METRIC=entropy            # or perplexity / self_confidence / none (default)
+export ENTROPY_THRESHOLD=1.0             # stop when entropy <= threshold
+export PERPLEXITY_THRESHOLD=3.0          # stop when perplexity <= threshold
+export SELF_CONF_THRESHOLD=0.8           # stop when self-conf >= threshold
+export DYNAMIC_MIN_TOKENS=64             # minimum generated tokens before checking
+```
+
+Leaving `DYNAMIC_METRIC=none` preserves the original fixed sampling behavior. When enabled, the CSVs include `dynamic_metric` and `dynamic_stop_triggered` columns for analysis.
+
+For convenience, `llm_experiments/dynamic_runs/` contains helper scripts:
+
+```bash
+# Entropy-based stopping (defaults to math local script unless you pass another path)
+bash llm_experiments/dynamic_runs/run_entropy.sh ./llm_experiments/local_scripts/power_samp_gpqa_local.sh
+
+# Perplexity-based stopping
+bash llm_experiments/dynamic_runs/run_perplexity.sh ./llm_experiments/local_scripts/power_samp_math_local.sh
+
+# Self-confidence-based stopping
+bash llm_experiments/dynamic_runs/run_self_confidence.sh ./llm_experiments/local_scripts/power_samp_he_local.sh
+```
+
+Each wrapper sets reasonable default thresholds; override by exporting the variables before running if needed.
 
 ## Evaluation
 **Single-shot Reasoning**
@@ -56,4 +85,16 @@ python llm_experiments/passk_math.py --folder=results/qwen_math/MATH
 ```
 The output is a plot of the pass@k performance. As with single-shot reasoning, ```eval_gpqa.py``` and ```eval_he.py``` are similar, but for the latter an additional ```--output_fname``` argument is required.
 
+## Sampling Diagnostics (Entropy/Perplexity/Self-confidence)
 
+Each `power_samp_*.py` script now logs entropy, perplexity, and self-confidence metrics for the naive/std/mcmc trajectories into the result CSVs. After generating results for a model, you can aggregate those metrics and build a simple predictor for how many samples are required per problem:
+
+```bash
+# Aggregate metrics into analysis/sampling_predictors/sampling_metrics.csv
+python llm_experiments/sampling_analysis/collect_metrics.py --folder results/qwen_math/MATH
+
+# Train/evaluate a linear predictor for sampling counts
+python llm_experiments/sampling_analysis/eval_predictor.py
+```
+
+Per-metric slices are also exported under `analysis/entropy_predictor/`, `analysis/perplexity_predictor/`, and `analysis/self_confidence_predictor/` for further experimentation.

@@ -24,9 +24,15 @@ import transformers
 from grader_utils.parse_utils import parse_answer
 from constants import *
 from power_samp_utils import *
+from metrics.generation_metrics import compute_generation_metrics, compute_metrics_from_log_probs
+from metrics.dynamic_controller import DynamicStopController
 
 
-def mcmc_power_samp_alp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16):
+def _blank_metrics():
+    return {"entropy": float("nan"), "perplexity": float("nan"), "self_confidence": float("nan")}
+
+
+def mcmc_power_samp_alp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16, stop_controller=None):
     c = len(context)
     print(f'Temp: {temp}')
     gen = []
@@ -72,15 +78,19 @@ def mcmc_power_samp_alp(p : AutoregressiveSampler, context, temp, mcmc_steps, ma
                 del log_prob_prop
                 del target_log_prob_cur
 
+        if stop_controller is not None and stop_controller(log_probs_norm):
+            acceptance_ratio = acceptances/attempts if attempts else 0.0
+            return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
+
         if p.tokenizer.eos_token_id in gen:
             eos_idx = gen.index(p.tokenizer.eos_token_id)
             gen = gen[:eos_idx + 1]
             log_probs_norm = log_probs_norm[:eos_idx + 1]
             log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
-            acceptance_ratio = acceptances/attempts
+            acceptance_ratio = acceptances/attempts if attempts else 0.0
             return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
-    acceptance_ratio = acceptances/attempts
+    acceptance_ratio = acceptances/attempts if attempts else 0.0
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
 
@@ -90,12 +100,18 @@ if __name__ == "__main__":
     parser.add_argument("--save_str", action = "store", type = str, default = "results/",  dest = "save_str")
     parser.add_argument("--model", action = "store", default = "qwen", type = str, choices = ["qwen", "qwen_math", "phi", "tulu", "qwen_math_grpo", "phi_grpo"])
     parser.add_argument("--temperature", action = "store", default = 0.25, type = float, dest = "temperature")
-    parser.add_argument("--dataset", action = "store", default = "MATH", type = str)
+    parser.add_argument("--dataset", action = "store", default = "ALPACA", type = str)
     parser.add_argument("--cot", action = "store", type = bool, default = True)
     parser.add_argument("--mcmc_steps", action = "store", type = int, default = 10)
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
+    parser.add_argument("--dynamic_metric", action="store", type=str, default="none",
+                        choices=["none", "entropy", "perplexity", "self_confidence"])
+    parser.add_argument("--entropy_threshold", type=float, default=1.0)
+    parser.add_argument("--perplexity_threshold", type=float, default=3.0)
+    parser.add_argument("--self_conf_threshold", type=float, default=0.8)
+    parser.add_argument("--dynamic_min_tokens", type=int, default=64)
     args = parser.parse_args()
 
     random.seed(0)
@@ -129,6 +145,10 @@ if __name__ == "__main__":
     if dataset_name == "ALPACA":
         json_file = 'data/ALPACA.json'
         dataset = json.load(open(json_file, "r"))
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+    N = len(dataset)
 
 
 
@@ -166,7 +186,23 @@ if __name__ == "__main__":
         print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("std done")
 
-        mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp_alp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
+        stop_controller = None
+        if args.dynamic_metric != "none":
+            stop_controller = DynamicStopController(
+                metric=args.dynamic_metric,
+                entropy_threshold=args.entropy_threshold,
+                perplexity_threshold=args.perplexity_threshold,
+                self_conf_threshold=args.self_conf_threshold,
+                min_tokens=args.dynamic_min_tokens,
+            )
+        mcmc_power_samp_output, log_probs_norm, _, acceptance_ratio = mcmc_power_samp_alp(
+            autoreg_sampler,
+            prefx,
+            temp,
+            mcmc_steps,
+            max_new_tokens=3072,
+            stop_controller=stop_controller,
+        )
 
         print(len(std_output))
         print(len(naive_temp_output))
@@ -182,7 +218,15 @@ if __name__ == "__main__":
         std_completion = tokenizer.decode(std_generated_ids, skip_special_tokens=True)
         mcmc_completion = tokenizer.decode(mcmc_power_samp_ids, skip_special_tokens=True)
 
-        
+        if args.dynamic_metric != "none":
+            naive_metrics = compute_generation_metrics(naive_temp_output.scores, naive_generated_ids)
+            std_metrics = compute_generation_metrics(std_output.scores, std_generated_ids)
+            mcmc_metrics = compute_metrics_from_log_probs(log_probs_norm)
+        else:
+            naive_metrics = _blank_metrics()
+            std_metrics = _blank_metrics()
+            mcmc_metrics = _blank_metrics()
+
 
         results.append({
             "dataset": source,
@@ -190,11 +234,21 @@ if __name__ == "__main__":
             "naive_completion": naive_completion,
             "std_completion": std_completion,
             "mcmc_completion": mcmc_completion,
+            "naive_entropy": naive_metrics["entropy"],
+            "naive_perplexity": naive_metrics["perplexity"],
+            "naive_self_confidence": naive_metrics["self_confidence"],
+            "std_entropy": std_metrics["entropy"],
+            "std_perplexity": std_metrics["perplexity"],
+            "std_self_confidence": std_metrics["self_confidence"],
+            "mcmc_entropy": mcmc_metrics["entropy"],
+            "mcmc_perplexity": mcmc_metrics["perplexity"],
+            "mcmc_self_confidence": mcmc_metrics["self_confidence"],
+            "acceptance_ratio": acceptance_ratio,
+            "dynamic_metric": args.dynamic_metric,
+            "dynamic_stop_triggered": stop_controller.triggered if stop_controller else False,
         })
 
     
     df = pd.DataFrame(results)
     df.to_csv(os.path.join(save_str, model+"_alpaca_base_power_samp_results_" + str(mcmc_steps) + "_" + str(temp) + "_" + str(args.batch_idx)  + "_" + str(args.seed) + ".csv"), index=False)
     
-
-
