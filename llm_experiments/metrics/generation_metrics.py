@@ -24,6 +24,15 @@ def compute_generation_metrics(scores: Iterable[torch.Tensor], generated_ids: to
         }
 
     score_tensor = torch.stack(score_list, dim=0).to(torch.float32)
+    # HF generate returns scores with shape [toks, batch, vocab]; we only decode one sample,
+    # so drop the redundant batch dimension when it is present to keep shapes aligned.
+    if score_tensor.dim() == 3:
+        if score_tensor.size(1) != 1:
+            raise ValueError(
+                "compute_generation_metrics expected batch size 1, got "
+                f"{score_tensor.size(1)}."
+            )
+        score_tensor = score_tensor[:, 0, :]
     token_ids = generated_ids.detach().to(torch.long).reshape(-1)
     steps = min(score_tensor.size(0), token_ids.size(0))
     if steps == 0:

@@ -1,7 +1,7 @@
 # ---------- Fixed sampling runs ----------
 # MATH (baselines separated by decoder, then multiple MCMC settings)
-BASELINE_VARIANT=naive RUN_MODE=baseline_only bash llm_experiments/local_scripts/power_samp_math_local.sh 2 5 --save_str results/math_baseline_naive/MATH_k1
-BASELINE_VARIANT=std RUN_MODE=baseline_only bash llm_experiments/local_scripts/power_samp_math_local.sh 2 5 --save_str results/math_baseline_std/MATH_k1
+RUN_MODE=baseline_only BASELINE_VARIANT=naive MCMC_STEPS=0 bash llm_experiments/local_scripts/power_samp_math_local.sh 2 5 --save_str results/math_baseline_naive/MATH_k0
+BASELINE_VARIANT=std RUN_MODE=baseline_only bash llm_experiments/local_scripts/power_samp_math_local.sh 2 5 --save_str results/math_baseline_std/MATH_k0
 
 RUN_MODE=mcmc_only MCMC_STEPS=2 bash llm_experiments/local_scripts/power_samp_math_local.sh 2 5 --save_str results/math_mcmc_k2/MATH
 RUN_MODE=mcmc_only MCMC_STEPS=4 bash llm_experiments/local_scripts/power_samp_math_local.sh 2 5 --save_str results/math_mcmc_k4/MATH
