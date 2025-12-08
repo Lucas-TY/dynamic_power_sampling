@@ -1,4 +1,6 @@
 import os
+import time
+import csv
 
 from contextlib import nullcontext
 from glob import glob
@@ -7,7 +9,6 @@ import random
 from tqdm import tqdm
 import argparse
 
-import pandas as pd
 import numpy as np
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -25,11 +26,46 @@ from grader_utils.parse_utils import parse_answer
 from constants import *
 from power_samp_utils import *
 from metrics.generation_metrics import compute_generation_metrics, compute_metrics_from_log_probs
-from metrics.dynamic_controller import DynamicStopController
 
 
 def _blank_metrics():
     return {"entropy": float("nan"), "perplexity": float("nan"), "self_confidence": float("nan")}
+
+
+_HIDDEN_STATE_LAYER_IDX = 11  # 0-based index inside outputs.hidden_states (includes embedding output)
+
+CSV_COLUMNS = [
+    "question",
+    "correct_answer",
+    "acceptance_ratio",
+    "run_mode",
+    "baseline_k",
+    "mcmc_k",
+    "question_time_sec",
+    "naive_completion",
+    "naive_answer",
+    "naive_entropy",
+    "naive_perplexity",
+    "naive_self_confidence",
+    "naive_hidden_state",
+    "std_completion",
+    "std_answer",
+    "std_entropy",
+    "std_perplexity",
+    "std_self_confidence",
+    "mcmc_completion",
+    "mcmc_answer",
+    "mcmc_entropy",
+    "mcmc_perplexity",
+    "mcmc_self_confidence",
+    "mcmc_entropy_series",
+    "mcmc_perplexity_series",
+    "mcmc_self_confidence_series",
+    "mcmc_hidden_state",
+    "std_correct",
+    "naive_correct",
+    "mcmc_correct",
+]
 
 
 def _extract_mid_hidden_state(model, token_ids, device):
@@ -38,8 +74,9 @@ def _extract_mid_hidden_state(model, token_ids, device):
     hidden_states = outputs.hidden_states
     if not hidden_states:
         return []
-    mid_idx = len(hidden_states) // 2
-    vec = hidden_states[mid_idx][0, -1, :].detach().to("cpu")
+    target_idx = _HIDDEN_STATE_LAYER_IDX
+    target_idx = max(0, min(target_idx, len(hidden_states) - 1))
+    vec = hidden_states[target_idx][0, -1, :].detach().to("cpu")
     return vec.tolist()
 
 
@@ -57,19 +94,38 @@ if __name__ == "__main__":
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
-    parser.add_argument("--run_mode", action="store", type=str, default="all",
-                        choices=["all", "baseline_only", "mcmc_only"],
-                        help="Run baselines+MCMC (all), only naive/std baselines, or only MCMC.")
-    parser.add_argument("--baseline_variant", action="store", type=str, default="both",
-                        choices=["both", "naive", "std"],
-                        help="Choose which baseline decoder(s) to run when run_mode includes baselines.")
-    parser.add_argument("--dynamic_metric", action="store", type=str, default="none",
-                        choices=["none", "entropy", "perplexity", "self_confidence"])
+    parser.add_argument(
+        "--run_mode",
+        action="store",
+        type=str,
+        default="all",
+        choices=["all", "baseline_only", "mcmc_only"],
+        help="Run baselines+MCMC (all), only naive/std baselines, or only MCMC.")
+    parser.add_argument(
+        "--baseline_variant",
+        action="store",
+        type=str,
+        default="both",
+        choices=["both", "naive", "std"],
+        help="Choose which baseline decoder(s) to run when run_mode includes baselines.")
+    parser.add_argument(
+        "--dynamic_metric",
+        action="store",
+        type=str,
+        default="none",
+        choices=["none", "entropy", "perplexity", "self_confidence"])
     parser.add_argument("--entropy_threshold", type=float, default=1.0)
     parser.add_argument("--perplexity_threshold", type=float, default=3.0)
     parser.add_argument("--self_conf_threshold", type=float, default=0.8)
     parser.add_argument("--dynamic_min_tokens", type=int, default=64)
+    parser.add_argument(
+        "--problem_idx",
+        type=int,
+        default=None,
+        help="Optional 0-based index inside the batch to run only that problem.")
     args = parser.parse_args()
+    if args.dynamic_metric != "none":
+        raise ValueError("Dynamic metric is disabled for fixed-k sampling runs.")
 
     random.seed(0)
 
@@ -81,8 +137,17 @@ if __name__ == "__main__":
     temp = args.temperature
     mcmc_steps = args.mcmc_steps
 
-    save_str = os.path.join(args.save_str, model)
-    os.makedirs(save_str, exist_ok=True)
+    temp_str = f"{temp:.6g}"
+    base_output_dir = os.path.join(
+        args.save_str,
+        model,
+        dataset_name,
+        f"run_mode={args.run_mode}",
+        f"baseline_variant={args.baseline_variant}",
+        f"temp={temp_str}",
+        f"k={mcmc_steps}",
+    )
+    os.makedirs(base_output_dir, exist_ok=True)
 
 
     print(model)
@@ -111,139 +176,160 @@ if __name__ == "__main__":
     autoreg_sampler = AutoregressiveSampler(hf_model, tokenizer, device)
 
     print("loaded models")
-    results = []
 
-    start = 100*args.batch_idx
-    end = 100*(args.batch_idx+1)
-
-    for problem, data in tqdm(enumerate(dataset[start:end]), desc = "Benchmark on MATH"):
-        question = data["prompt"]
-        print(question)
-        answer = data["answer"]
-
-        input_text = format_prompt(question, model, tokenizer, cot)
-        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
-        prefx = [idx.item() for idx in input_ids[0]]
-        run_baseline = args.run_mode in ("all", "baseline_only")
-        run_mcmc = args.run_mode in ("all", "mcmc_only")
-        run_naive = run_baseline and args.baseline_variant in ("both", "naive")
-        run_std = run_baseline and args.baseline_variant in ("both", "std")
-        if args.dynamic_metric != "none" and not run_mcmc:
-            raise ValueError("Dynamic sampling requires run_mode that includes MCMC.")
-
-        naive_completion = ""
-        std_completion = ""
-        naive_metrics = _blank_metrics()
-        std_metrics = _blank_metrics()
-        naive_hidden_vec = []
-        if run_naive:
-            naive_temp_output = hf_model.generate(
-                input_ids,
-                max_new_tokens=3072,
-                return_dict_in_generate=True,
-                output_scores=True,
-                do_sample=True,
-                temperature=temp,
+    batch_size = 100
+    start = batch_size * args.batch_idx
+    end = min(len(dataset), batch_size * (args.batch_idx + 1))
+    batch_slice = dataset[start:end]
+    if not batch_slice:
+        raise ValueError(f"No samples available for batch_idx={args.batch_idx}.")
+    if args.problem_idx is not None:
+        if args.problem_idx < 0 or args.problem_idx >= len(batch_slice):
+            raise ValueError(
+                f"problem_idx={args.problem_idx} is out of range for batch_idx={args.batch_idx} "
+                f"(valid range: 0-{len(batch_slice) - 1})."
             )
-            naive_generated_ids = naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
-            naive_completion = tokenizer.decode(naive_generated_ids, skip_special_tokens=True)
-            if args.dynamic_metric != "none":
-                naive_metrics = compute_generation_metrics(naive_temp_output.scores, naive_generated_ids)
-            naive_ids_tensor = naive_temp_output.sequences[0].detach().clone().to(torch.long)
-            naive_hidden_vec = _extract_mid_hidden_state(hf_model, naive_ids_tensor, device)
-        if run_std:
-            std_output = hf_model.generate(
-                input_ids,
-                max_new_tokens=3072,
-                return_dict_in_generate=True,
-                output_scores=True,
-                do_sample=True,
-            )
-            std_generated_ids = std_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
-            std_completion = tokenizer.decode(std_generated_ids, skip_special_tokens=True)
-            if args.dynamic_metric != "none":
-                std_metrics = compute_generation_metrics(std_output.scores, std_generated_ids)
-        acceptance_ratio = float("nan")
-        mcmc_completion = ""
-        mcmc_metrics = _blank_metrics()
-        mcmc_power_samp_ids = torch.tensor([], dtype=torch.long)
-        dynamic_triggered = False
-        mcmc_hidden_vec = []
-        stop_controller = None
-        if run_mcmc:
-            if args.dynamic_metric != "none":
-                stop_controller = DynamicStopController(
-                    metric=args.dynamic_metric,
-                    entropy_threshold=args.entropy_threshold,
-                    perplexity_threshold=args.perplexity_threshold,
-                    self_conf_threshold=args.self_conf_threshold,
-                    min_tokens=args.dynamic_min_tokens,
+        iter_batch = [(args.problem_idx, batch_slice[args.problem_idx])]
+    else:
+        iter_batch = list(enumerate(batch_slice))
+
+    output_fname = (
+        f"{model}_{dataset_name}_run-{args.run_mode}_base-{args.baseline_variant}_"
+        f"power_samp_results_{mcmc_steps}_{temp_str}_{args.batch_idx}_{args.seed}"
+    )
+    if args.problem_idx is not None:
+        output_fname += f"_problem-{args.problem_idx}"
+    output_fname += ".csv"
+    output_path = os.path.join(base_output_dir, output_fname)
+    with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        for problem, data in tqdm(iter_batch, desc="Benchmark on MATH"):
+            question_timer = time.perf_counter()
+            question = data["prompt"]
+            print(question)
+            answer = data["answer"]
+
+            input_text = format_prompt(question, model, tokenizer, cot)
+            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
+            prefx = [idx.item() for idx in input_ids[0]]
+            run_baseline = args.run_mode in ("all", "baseline_only")
+            run_mcmc = args.run_mode in ("all", "mcmc_only")
+            run_naive = run_baseline and args.baseline_variant in ("both", "naive")
+            run_std = run_baseline and args.baseline_variant in ("both", "std")
+            naive_completion = ""
+            std_completion = ""
+            naive_metrics = _blank_metrics()
+            std_metrics = _blank_metrics()
+            naive_hidden_vec = []
+            if run_naive:
+                naive_temp_output = hf_model.generate(
+                    input_ids,
+                    max_new_tokens=3072,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    do_sample=True,
+                    temperature=temp,
                 )
-            mcmc_power_samp_output, log_probs_norm, _, acceptance_ratio = mcmc_power_samp(
-                autoreg_sampler,
-                prefx,
-                temp,
-                mcmc_steps,
-                max_new_tokens=3072,
-                stop_controller=stop_controller,
-            )
-            mcmc_power_samp_ids = torch.tensor([mcmc_power_samp_output], dtype=torch.long, device=device).squeeze().to("cpu")
-            mcmc_completion = tokenizer.decode(mcmc_power_samp_ids, skip_special_tokens=True)
-            if args.dynamic_metric != "none":
+                naive_generated_ids = naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
+                naive_completion = tokenizer.decode(naive_generated_ids, skip_special_tokens=True)
+                naive_metrics = compute_generation_metrics(naive_temp_output.scores, naive_generated_ids)
+                naive_ids_tensor = naive_temp_output.sequences[0].detach().clone().to(torch.long)
+                naive_hidden_vec = _extract_mid_hidden_state(hf_model, naive_ids_tensor, device)
+            if run_std:
+                std_output = hf_model.generate(
+                    input_ids,
+                    max_new_tokens=3072,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    do_sample=True,
+                )
+                std_generated_ids = std_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
+                std_completion = tokenizer.decode(std_generated_ids, skip_special_tokens=True)
+                std_metrics = compute_generation_metrics(std_output.scores, std_generated_ids)
+            acceptance_ratio = float("nan")
+            mcmc_completion = ""
+            mcmc_metrics = _blank_metrics()
+            mcmc_power_samp_ids = torch.tensor([], dtype=torch.long)
+            mcmc_hidden_vec = []
+            mcmc_entropy_series = []
+            mcmc_perplexity_series = []
+            mcmc_self_conf_series = []
+            if run_mcmc:
+                mcmc_power_samp_output, log_probs_norm, _, acceptance_ratio = mcmc_power_samp(
+                    autoreg_sampler,
+                    prefx,
+                    temp,
+                    mcmc_steps,
+                    max_new_tokens=3072,
+                )
+                mcmc_power_samp_ids = torch.tensor([mcmc_power_samp_output], dtype=torch.long, device=device).squeeze().to("cpu")
+                mcmc_completion = tokenizer.decode(mcmc_power_samp_ids, skip_special_tokens=True)
                 mcmc_metrics = compute_metrics_from_log_probs(log_probs_norm)
-            else:
-                mcmc_metrics = _blank_metrics()
-            mcmc_ids_tensor = torch.tensor(mcmc_power_samp_output, dtype=torch.long)
-            mcmc_hidden_vec = _extract_mid_hidden_state(hf_model, mcmc_ids_tensor, device)
-            dynamic_triggered = stop_controller.triggered if stop_controller else False
+                mcmc_entropy_series = mcmc_metrics.get("entropy_series", [])
+                mcmc_perplexity_series = mcmc_metrics.get("perplexity_series", [])
+                mcmc_self_conf_series = mcmc_metrics.get("self_confidence_series", [])
+                mcmc_ids_tensor = torch.tensor(mcmc_power_samp_output, dtype=torch.long)
+                mcmc_hidden_vec = _extract_mid_hidden_state(hf_model, mcmc_ids_tensor, device)
 
-        naive_answer = parse_answer(naive_completion) if run_baseline else ""
-        std_answer = parse_answer(std_completion) if run_baseline else ""
-        mcmc_answer = parse_answer(mcmc_completion) if run_mcmc else ""
-        
-        if run_naive:
-            print(naive_answer)
-        if run_std:
-            print(std_answer)
-        if run_mcmc:
-            print(mcmc_answer)
-        print(question)
-        print(answer)
-        print(f'Acceptance: {acceptance_ratio}')
+            naive_answer = parse_answer(naive_completion) if run_baseline else ""
+            std_answer = parse_answer(std_completion) if run_baseline else ""
+            mcmc_answer = parse_answer(mcmc_completion) if run_mcmc else ""
+            
+            if run_naive:
+                print(naive_answer)
+            if run_std:
+                print(std_answer)
+            if run_mcmc:
+                print(mcmc_answer)
+            print(question)
+            print(answer)
+            print(f'Acceptance: {acceptance_ratio}')
 
 
-        results.append({
-            "question": question,
-            "correct_answer": answer,
-            "naive_completion": naive_completion,
-            "naive_answer": naive_answer,
-            "std_completion": std_completion,
-            "std_answer": std_answer,
-            "mcmc_completion": mcmc_completion,
-            "mcmc_answer": mcmc_answer,
-            "naive_entropy": naive_metrics["entropy"],
-            "naive_perplexity": naive_metrics["perplexity"],
-            "naive_self_confidence": naive_metrics["self_confidence"],
-            "std_entropy": std_metrics["entropy"],
-            "std_perplexity": std_metrics["perplexity"],
-            "std_self_confidence": std_metrics["self_confidence"],
-            "mcmc_entropy": mcmc_metrics["entropy"],
-            "mcmc_perplexity": mcmc_metrics["perplexity"],
-            "mcmc_self_confidence": mcmc_metrics["self_confidence"],
-            "acceptance_ratio": acceptance_ratio,
-            "dynamic_metric": args.dynamic_metric,
-            "dynamic_stop_triggered": dynamic_triggered,
-            "naive_hidden_state": json.dumps(naive_hidden_vec) if naive_hidden_vec else "",
-            "mcmc_hidden_state": json.dumps(mcmc_hidden_vec) if mcmc_hidden_vec else "",
-            "run_mode": args.run_mode,
-            "baseline_k": 1,
-            "mcmc_k": mcmc_steps,
-        })
+            elapsed = time.perf_counter() - question_timer
 
-    
-    df = pd.DataFrame(results)
-    df.to_csv(os.path.join(save_str, model+"_math_base_power_samp_results_" + str(mcmc_steps) + "_" + str(temp) + "_" + str(args.batch_idx)  + "_" + str(args.seed) + ".csv"), index=False)
-    
+            record = {col: "" for col in CSV_COLUMNS}
+            record.update({
+                "question": question,
+                "correct_answer": answer,
+                "acceptance_ratio": acceptance_ratio,
+                "run_mode": args.run_mode,
+                "baseline_k": 1 if run_baseline else 0,
+                "mcmc_k": mcmc_steps if run_mcmc else 0,
+                "question_time_sec": elapsed,
+            })
+            if run_naive:
+                record.update({
+                    "naive_completion": naive_completion,
+                    "naive_answer": naive_answer,
+                    "naive_entropy": naive_metrics["entropy"],
+                    "naive_perplexity": naive_metrics["perplexity"],
+                    "naive_self_confidence": naive_metrics["self_confidence"],
+                    "naive_hidden_state": json.dumps(naive_hidden_vec) if naive_hidden_vec else "",
+                })
+            if run_std:
+                record.update({
+                    "std_completion": std_completion,
+                    "std_answer": std_answer,
+                    "std_entropy": std_metrics["entropy"],
+                    "std_perplexity": std_metrics["perplexity"],
+                    "std_self_confidence": std_metrics["self_confidence"],
+                })
+            if run_mcmc:
+                record.update({
+                    "mcmc_completion": mcmc_completion,
+                    "mcmc_answer": mcmc_answer,
+                    "mcmc_entropy": mcmc_metrics["entropy"],
+                    "mcmc_perplexity": mcmc_metrics["perplexity"],
+                    "mcmc_self_confidence": mcmc_metrics["self_confidence"],
+                    "mcmc_entropy_series": json.dumps(mcmc_entropy_series),
+                    "mcmc_perplexity_series": json.dumps(mcmc_perplexity_series),
+                    "mcmc_self_confidence_series": json.dumps(mcmc_self_conf_series),
+                    "mcmc_hidden_state": json.dumps(mcmc_hidden_vec) if mcmc_hidden_vec else "",
+                })
+
+            writer.writerow(record)
 
 
 

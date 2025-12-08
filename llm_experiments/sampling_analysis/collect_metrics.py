@@ -36,7 +36,7 @@ def parse_metadata(path: Path) -> Dict[str, float]:
 
 def load_results(folder: Path) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
-    for csv_path in sorted(folder.glob("*.csv")):
+    for csv_path in sorted(folder.rglob("*.csv")):
         df = pd.read_csv(csv_path)
         for key, value in parse_metadata(csv_path).items():
             df[key] = value
