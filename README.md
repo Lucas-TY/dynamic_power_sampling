@@ -1,6 +1,6 @@
 # Reasoning with Sampling【WIP】
 
-##Original Paper
+## Original Paper
 ### [Paper](https://arxiv.org/abs/2510.14901) | [Project Page](https://aakaran.github.io/reasoning_with_sampling/)
 
 [![rws](teaser.png)](teaser.png)
