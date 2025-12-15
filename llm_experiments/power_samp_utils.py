@@ -25,8 +25,12 @@ from grader_utils.parse_utils import parse_answer
 from constants import *
 
 ### DESCRIPTION ###
-# power sampling to sample from p^{alpha}, where p is the base model
-# takes in 1/alpha (temperature) as an argument (default 0.25), and mcmc_power_samp implements sampling from p^{alpha} 
+# Power sampling targets a power distribution pi_alpha(x|q) ∝ p_theta(x|q)^alpha (alpha > 1),
+# and approximates sampling via Metropolis–Hastings updates in token space.
+# In this codebase, the CLI flag `--temperature/--temp` corresponds to 1/alpha.
+#
+# Note: `mcmc_steps` throughout the scripts refers to the number of MH proposals per block,
+# not the "trajectory budget k" used in the Dynamic Power Sampling (DPS) paper.
 
 
 class AutoregressiveSampler:

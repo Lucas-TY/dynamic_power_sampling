@@ -99,10 +99,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_str", action = "store", type = str, default = "results/",  dest = "save_str")
     parser.add_argument("--model", action = "store", default = "qwen", type = str, choices = ["qwen", "qwen_math", "phi", "tulu", "qwen_math_grpo", "phi_grpo"])
-    parser.add_argument("--temperature", action = "store", default = 0.25, type = float, dest = "temperature")
+    parser.add_argument("--temperature", "--temp", action = "store", default = 0.25, type = float, dest = "temperature")
     parser.add_argument("--dataset", action = "store", default = "ALPACA", type = str)
     parser.add_argument("--cot", action = "store", type = bool, default = True)
-    parser.add_argument("--mcmc_steps", action = "store", type = int, default = 10)
+    parser.add_argument(
+        "--mcmc_steps",
+        action="store",
+        type=int,
+        default=10,
+        help="Number of MH proposals per block (not the DPS trajectory budget k).",
+    )
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)

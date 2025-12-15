@@ -12,7 +12,7 @@ set -euo pipefail
 #   MODEL_NAME (default: qwen_math)
 #   MCMC_STEPS (default: 10)
 #   TEMP (default: 0.25)
-#   DYNAMIC_METRIC (default: none; entropy/perplexity/self_confidence)
+#   DYNAMIC_METRIC (default: none; entropy/perplexity/self_confidence; not supported by power_samp_math.py)
 #   ENTROPY_THRESHOLD (default: 1.0)
 #   PERPLEXITY_THRESHOLD (default: 3.0)
 #   SELF_CONF_THRESHOLD (default: 0.8)

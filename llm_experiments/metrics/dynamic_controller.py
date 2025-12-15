@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+"""
+Metric-based early stopping for MH token-space sampling.
+
+This module is separate from the paper's "Dynamic Power Sampling (DPS)" controller:
+- DPS schedules the *trajectory budget* k (e.g. k ∈ {2,4,6,8}) using scalar statistics
+  and intermediate hidden states.
+- This file implements an optional heuristic that *stops a single MH chain early* when
+  entropy/perplexity/self-confidence crosses a threshold.
+"""
+
 from dataclasses import dataclass
 from typing import List
 

@@ -32,7 +32,7 @@ def _blank_metrics():
     return {"entropy": float("nan"), "perplexity": float("nan"), "self_confidence": float("nan")}
 
 
-_HIDDEN_STATE_LAYER_IDX = 11  # 0-based index inside outputs.hidden_states (includes embedding output)
+_HIDDEN_STATE_LAYER_IDX = 11  # layer-11 as used in the DPS paper (0-based; includes embedding output)
 
 CSV_COLUMNS = [
     "question",
@@ -76,6 +76,8 @@ def _extract_mid_hidden_state(model, token_ids, device):
         return []
     target_idx = _HIDDEN_STATE_LAYER_IDX
     target_idx = max(0, min(target_idx, len(hidden_states) - 1))
+    # This logs a single per-sample vector (last token at the chosen layer).
+    # The DPS paper uses block-wise averaged layer features aggregated across trajectories.
     vec = hidden_states[target_idx][0, -1, :].detach().to("cpu")
     return vec.tolist()
 
@@ -87,10 +89,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_str", action = "store", type = str, default = "results/",  dest = "save_str")
     parser.add_argument("--model", action = "store", default = "qwen", type = str, choices = ["qwen", "qwen_math", "phi", "tulu", "qwen_math_grpo", "phi_grpo"])
-    parser.add_argument("--temperature", action = "store", default = 0.25, type = float, dest = "temperature")
+    parser.add_argument("--temperature", "--temp", action = "store", default = 0.25, type = float, dest = "temperature")
     parser.add_argument("--dataset", action = "store", default = "MATH", type = str)
     parser.add_argument("--cot", action = "store", type = bool, default = True)
-    parser.add_argument("--mcmc_steps", action = "store", type = int, default = 10)
+    parser.add_argument(
+        "--mcmc_steps",
+        action="store",
+        type=int,
+        default=10,
+        help="Number of MH proposals per block (not the DPS trajectory budget k).",
+    )
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
@@ -125,7 +133,9 @@ if __name__ == "__main__":
         help="Optional 0-based index inside the batch to run only that problem.")
     args = parser.parse_args()
     if args.dynamic_metric != "none":
-        raise ValueError("Dynamic metric is disabled for fixed-k sampling runs.")
+        raise ValueError(
+            "Metric-based early stopping is disabled for MATH runs to keep results comparable."
+        )
 
     random.seed(0)
 

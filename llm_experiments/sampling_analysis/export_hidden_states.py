@@ -63,8 +63,7 @@ def export_hidden_states(folder: Path, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as f:
         for rec in records:
-            f.write(json.dumps(rec) + "
-")
+            f.write(json.dumps(rec) + "\n")
     print(f"[export] wrote {len(records)} entries to {output}")
 
 
